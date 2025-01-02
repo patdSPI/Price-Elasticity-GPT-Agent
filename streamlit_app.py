@@ -1,56 +1,87 @@
+import sqlite3
+import openai
 import streamlit as st
-from openai import OpenAI
+from pathlib import Path
 
-# Show title and description.
-st.title("💬 Chatbot")
-st.write(
-    "This is a simple chatbot that uses OpenAI's GPT-3.5 model to generate responses. "
-    "To use this app, you need to provide an OpenAI API key, which you can get [here](https://platform.openai.com/account/api-keys). "
-    "You can also learn how to build this app step by step by [following our tutorial](https://docs.streamlit.io/develop/tutorials/llms/build-conversational-apps)."
-)
+OPENAI_API_KEY = st.secrets['api_key']
+DATABASE_PATH = "restaurant_sales.sqlite3"
+MODEL = 'gpt-4o'
 
-# Ask user for their OpenAI API key via `st.text_input`.
-# Alternatively, you can store the API key in `./.streamlit/secrets.toml` and access it
-# via `st.secrets`, see https://docs.streamlit.io/develop/concepts/connections/secrets-management
-openai_api_key = st.text_input("OpenAI API Key", type="password")
-if not openai_api_key:
-    st.info("Please add your OpenAI API key to continue.", icon="🗝️")
-else:
+def get_db_path(filename):
+    db_path = Path(__file__).parents[0] / filename
+    return db_path.__str__()
 
-    # Create an OpenAI client.
-    client = OpenAI(api_key=openai_api_key)
+def get_conn(filename):
+    db_path = get_db_path(filename)
+    conn = sqlite3.connect(db_path)
+    return conn
 
-    # Create a session state variable to store the chat messages. This ensures that the
-    # messages persist across reruns.
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-
-    # Display the existing chat messages via `st.chat_message`.
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-
-    # Create a chat input field to allow the user to enter a message. This will display
-    # automatically at the bottom of the page.
-    if prompt := st.chat_input("What is up?"):
-
-        # Store and display the current prompt.
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
-
-        # Generate a response using the OpenAI API.
-        stream = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+def handle_user_question(conn, api_key, user_query, model):
+    # Use GPT for general questions
+    if not any(keyword in user_query.lower() for keyword in ["store", "category", "sales", "units", "elasticity"]):
+        openai.api_key = api_key
+        response = openai.ChatCompletion.create(
+            model=model,
             messages=[
-                {"role": m["role"], "content": m["content"]}
-                for m in st.session_state.messages
-            ],
-            stream=True,
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": user_query}
+            ]
+        )
+        return response['choices'][0]['message']['content']
+    
+    # Handle database queries
+    try:
+        cursor = conn.cursor()
+        if "highest netsales" in user_query.lower():
+            cursor.execute("SELECT Store, MAX(NetSales) FROM sales_data")  # Replace 'sales_data' with your actual table name
+            result = cursor.fetchone()
+            return f"The store with the highest NetSales is {result[0]} with sales of {result[1]}."
+        elif "largest netunits" in user_query.lower():
+            cursor.execute("SELECT ItemDescription, MAX(NetUnits) FROM sales_data")  # Replace 'sales_data' with your actual table name
+            result = cursor.fetchone()
+            return f"The item with the largest NetUnits sold is {result[0]} with {result[1]} units."
+        else:
+            return "I'm not sure how to answer that. Can you rephrase or provide more details?"
+    except Exception as e:
+        return f"An error occurred while querying the database: {e}"
+
+def main():
+    st.title("Restaurant Pricing Analyst")
+    if "messages" not in st.session_state:
+        st.session_state["messages"] = []
+
+        welcome_message = (
+            "Hello, and welcome to the **Restaurant Pricing Analyst**!\n\n"
+            "I'm here to help you explore restaurant sales data and elasticity. "
+            "Below are some **sample questions** you might ask:\n"
+            "- *Which store has the highest NetSales?*\n"
+            "- *What is the sales-weighted elasticity for each Category?*\n"
+            "- *Which item descriptions have the largest NetUnits sold?*\n\n"
+            "Feel free to experiment by typing your question in the chat box below!"
         )
 
-        # Stream the response to the chat using `st.write_stream`, then store it in 
-        # session state.
-        with st.chat_message("assistant"):
-            response = st.write_stream(stream)
-        st.session_state.messages.append({"role": "assistant", "content": response})
+        st.session_state["messages"].append({"role": "assistant", "content": welcome_message})
+
+    conn = get_conn(DATABASE_PATH)
+    user_query = st.chat_input("Ask a question about the restaurant data...")
+
+    if user_query:
+        st.session_state["messages"].append({"role": "user", "content": user_query})
+        
+        try:
+            answer = handle_user_question(conn, OPENAI_API_KEY, user_query, MODEL)
+        except Exception as e:
+            answer = f"An error occurred: {e}"
+        
+        st.session_state["messages"].append({"role": "assistant", "content": answer})
+
+        for msg in st.session_state["messages"]:
+            if msg["role"] == "user":
+                with st.chat_message("user"):
+                    st.write(msg["content"])
+            elif msg["role"] == "assistant":
+                with st.chat_message("assistant"):
+                    st.write(msg["content"])
+
+if __name__ == "__main__":
+    main()
