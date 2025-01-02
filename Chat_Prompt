@@ -1,0 +1,231 @@
+#%%
+import sqlite3
+import os
+from openai import OpenAI
+import streamlit as st
+import matplotlib.pyplot as plt
+
+###############################################################################
+# 1) Example: known columns/tables for our dataset
+###############################################################################
+KNOWN_TABLES = {
+    "sales_data": ["id", "Store", "Category", "SubCategory", "ItemDescription", 'Price', "Elasticity", "NetUnits", "NetSales"]
+}
+DEFAULT_TABLE = "sales_data"  # If user doesn’t specify a table, we use this
+
+###############################################################################
+# 2) Helper function to query the SQLite DB safely
+###############################################################################
+def execute_sql_query(conn, query, params=None):
+    """
+    Executes a SQL query on the provided SQLite database path and returns the results.
+    params: for parameterized queries (tuple), e.g. (store_name,).
+    """
+    cursor = conn.cursor()
+
+    if params is None:
+        cursor.execute(query)
+    else:
+        cursor.execute(query, params)
+
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+###############################################################################
+# 3) GPT-based query generator (demo)
+###############################################################################
+def generate_sql_query(api_key, user_question, model):
+    """
+    1) Asks GPT to generate a SQL query for our known schema.
+    2) Tries to parse/validate the result so we only execute safe queries.
+    
+    NOTE: This is just a demonstration approach. In production, you might do:
+          - A rules-based approach
+          - A fine-tuned GPT model 
+          - A chain-of-thought approach with thorough validation
+    """
+    
+    # GPT system prompt: we instruct the model about the DB schema and how to produce a safe SQL query
+    system_prompt = (
+        "You are an AI that converts plain English questions into SQL queries. "
+        "You have the following table(s) with columns:\n\n"
+        "sales_data: id, Store, Category, SubCategory, ItemDescription, Price, Elasticity, NetUnits, NetSales.\n\n"
+        "Constraints:\n"
+        "1) Only select from 'sales_data'.\n"
+        "2) You can reference columns that exist in the schema.\n"
+        "3) Avoid subqueries or advanced features; produce a simple SELECT query.\n"
+        "4) If the user question is not relevant to the schema, respond 'NO_QUERY'.\n"
+        "5) Use a limit of 1000 if you think the query might return a large number of rows.\n"
+        "6) Do not execute update/insert/delete.\n\n"
+        "Your output should be just the SQL query without code blocks, like:\n"
+        "SELECT ...;\n"
+
+        "A few important notes about your queries:\n"
+        "1) Unless asked about a specific store, assume that most questions will be aggregated for all stores, meaning you'll need to either sum or average\n"
+        "   for all stores. If the user asks about a specific store, you should provide the answer for that store only.\n\n"
+        "2) Pricing opportunity, power, etc. refers to items that could be priced higher to increase NetSales, while accounting for elasticity. If using\n"
+        "   elasticity at the store or product level, you will likely need to generate a sales weighted average elasticity for the store, category, or product.\n"
+        "   An example query would be: SELECT ItemDescription, sum(Elasticity*NetSales)/sum(NetSales) AS AvgElasticity FROM sales_data GROUP BY ItemDescription;\n\n"
+        "3) Try to base answers using sound economic principles and data analysis, while making them easy to understand for a non-technical audience"
+        
+    )
+    
+    # GPT user prompt: the actual user question
+    user_prompt = (
+        f"Convert this user question into a valid SQL query on the sales_data table:\n"
+        f"User question: {user_question}\n"
+    )
+
+    client = OpenAI(api_key=api_key)
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        temperature=0.0,
+    )
+    
+    # Extract GPT’s raw text response (the proposed SQL query or 'NO_QUERY')
+    sql_query_candidate = response.choices[0].message.content.strip()
+    
+    # 1) Basic check: if GPT says 'NO_QUERY', we handle that.
+    if "NO_QUERY" in sql_query_candidate.upper():
+        return None
+
+    # 2) Basic sanitization check: ensure it’s a SELECT statement, referencing only known table(s) & columns.
+    if not sql_query_candidate.lower().startswith("select"):
+        return None
+
+    # 3) Validate that references are known columns. You can parse this more thoroughly with a real SQL parser, 
+    #    but here’s a minimal approach: we look for potential columns in the SELECT and WHERE clauses, 
+    #    compare to KNOWN_TABLES, etc. We also ensure only the table "sales_data" is referenced.
+
+    # For a quick hacky approach, let's check if the string 'FROM' references something in our KNOWN_TABLES
+    if "from sales_data" not in sql_query_candidate.lower():
+        return None
+
+    # Optionally, you might do a more granular check that each "column" token is in the known columns list.
+    # e.g., parse by space, commas, etc. This is incomplete but a start:
+    # (Skipping the robust approach for brevity.)
+    
+    return sql_query_candidate
+
+###############################################################################
+# 4) ChatGPT to produce final analysis once we have data
+###############################################################################
+def analyze_query_results(api_key, user_question, query, rows, model):
+    """
+    Summarize the query results in the context of the user question.
+    We’ll pass the data (as a concise string) plus the user question to ChatGPT,
+    so it can produce a final answer.
+    """
+    client = OpenAI(api_key=api_key)
+    
+    # Convert rows to a textual summary (careful about large data -> might exceed token limit).
+    # For demo, let's just show up to 20 rows max, or you could summarize more systematically.
+    max_rows_to_show = 20
+    displayed_rows = rows[:max_rows_to_show]
+    
+    # Build a table-like string. This is simplistic; consider using CSV or JSON if easier.
+    row_lines = []
+    for r in displayed_rows:
+        row_str = ", ".join(str(x) for x in r)
+        row_lines.append(row_str)
+    row_text = "\n".join(row_lines)
+    
+    # If there are more rows than shown, note that
+    if len(rows) > max_rows_to_show:
+        row_text += f"\n(Additional {len(rows)-max_rows_to_show} rows not displayed.)"
+    
+    # Now pass the user question + query + a snippet of data
+    system_prompt = (
+        '''You are a data analyst with a background in econometric who has access to sales and elasticity data for product-store pairs for a given restaurant.
+           In order to answer user questions, you can rely on your economic understandingg and/or the results of a SQL query. You will use these results 
+           to answer the user's question in a concise, helpful manner.
+           Try to base answers using sound economic principles and data analysis, while making them easy to understand for a non-technical audience
+        '''
+    )
+    user_prompt = (
+        f"User question: {user_question}\n\n"
+        f"SQL query used:\n{query}\n\n"
+        f"Query results (up to {max_rows_to_show} rows):\n{row_text}\n\n"
+        "Please provide your analysis or answer based on these query results."
+    )
+    
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        temperature=0.3
+    )
+    
+    return response.choices[0].message.content
+
+###############################################################################
+# 5) Putting it all together in a single function
+###############################################################################
+def handle_user_question(conn, api_key, user_question, model):
+    """
+    High-level function:
+      1. Generate a SQL query from the user's question (via GPT).
+      2. Validate the query (naive approach).
+      3. Execute the query on local DB if valid.
+      4. Send the results + user question to GPT for final analysis.
+      5. Return the final answer text.
+    """
+    # Step A: Let GPT propose a SQL query
+    query = generate_sql_query(api_key=api_key, user_question=user_question, model=model)
+    print(query)
+    
+    if not query:
+        # Return a more helpful response:
+        # Suggest what the bot can do, what data is available, and how to reframe the question.
+        return (
+            "I'm sorry, but I couldn't interpret your question in a way that fits the available data. "
+            "Let me tell you what I can do:\n\n"
+            "• I have data for restaurant sales, including columns like Store, Category, SubCategory, ItemDescription, Elasticity, Price, NetUnits, and NetSales.\n"
+            "• I can run SQL queries that reference these columns to find things like average NetSales, total units sold, or an elasticity analysis.\n"
+            "• For example, you might ask: \"Which store has the highest average NetSales?\" or \"What is the sales-weighted elasticity by Category?\"\n\n"
+            "Please try reframing your question to refer to these columns or a relevant analysis. I'm here to help!"
+        )
+    
+    # Step B: Execute the query
+    try:
+        rows = execute_sql_query(conn, query)
+    except Exception as e:
+        return f"Error running query: {e}"
+    
+    # Step C: Let GPT analyze the results
+    final_answer = analyze_query_results(api_key, user_question, query, rows, model)
+    return final_answer
+
+
+
+
+# # OPENPAI_API_KEY = os.getenv("OPENAI_API_KEY", "YOUR-API-KEY-HERE")
+# OPENAI_API_KEY = st.secrets['api_key']
+# DATABASE_PATH = "restaurant_sales.sqlite3"
+# conn = sqlite3.connect(DATABASE_PATH)
+# MODEL = 'gpt-4o'
+# # Example user questions
+# user_questions = [
+#     # 'which three products should be retired based upon their pricing power?',
+#     # 'what is the least popular menu item across all stores?'
+#     'please create a barplot of sales for each product category',
+#     # "Show me the top 5 items by NetUnits sold, summing across all stores"
+#     # 'Out of all of my stores, which store should I change prices for to increase my NetSales, while accounting for elasticity?'
+# ]
+
+# for q in user_questions:
+#     print("=== USER QUESTION ===")
+#     print(q)
+#     print("=== ANSWER ===")
+#     answer = handle_user_question(conn, OPENAI_API_KEY, q, MODEL)
+#     print(answer)
+#     print("\n\n")
+
+# %%
